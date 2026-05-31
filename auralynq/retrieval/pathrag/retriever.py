@@ -1,0 +1,256 @@
+"""PathRAG graph retrieval (Chen et al., 2025) — clean-room implementation.
+
+Pipeline:
+  1. **Node retrieval** — map the query to seed entities (exact + fuzzy + embedding
+     similarity over entity names).
+  2. **Relational path expansion** — bounded-hop DFS over the knowledge graph from
+     each seed, enumerating candidate relational paths.
+  3. **Flow-based pruning** — distribute a resource budget from the seeds along
+     edges with per-hop decay; each edge accrues 'flow'. A path's flow is its
+     bottleneck (min edge flow). Low-flow paths are pruned.
+  4. **Path-reliability scoring** — combine path flow with mean edge reliability.
+  5. **Path-to-text prompting** — render each surviving path as a grounded
+     statement with provenance.
+  6. **Golden-region ordering** — order paths so the most reliable sit at the
+     prompt edges (mitigates lost-in-the-middle).
+
+Isolated under ``auralynq/retrieval/pathrag/`` (ADR-0006).
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+
+from auralynq.embeddings.base import Embedder
+from auralynq.embeddings.factory import get_embedder
+from auralynq.ingest.models import Chunk
+from auralynq.retrieval.base import Retriever
+from auralynq.retrieval.models import Filter, PathEvidence, RetrievalResult, ScoredChunk
+from auralynq.retrieval.pathrag.graph import KnowledgeGraph
+from auralynq.utils import tokenize
+from auralynq.vectorstore.base import VectorStore
+
+DECAY = 0.8  # per-hop resource decay
+
+
+@dataclass
+class _Path:
+    nodes: list[str]
+    edges: list[dict]
+    flow: float
+    reliability: float
+
+    @property
+    def score(self) -> float:
+        return self.flow * (0.5 + 0.5 * self.reliability)
+
+
+class PathRAGRetriever(Retriever):
+    name = "pathrag"
+
+    def __init__(
+        self,
+        graph: KnowledgeGraph,
+        store: VectorStore | None = None,
+        embedder: Embedder | None = None,
+        *,
+        max_hops: int = 3,
+        max_paths: int = 8,
+        beam: int = 6,
+    ) -> None:
+        self.graph = graph
+        self.store = store
+        self.embedder = embedder or get_embedder()
+        self.max_hops = max_hops
+        self.max_paths = max_paths
+        self.beam = beam
+
+    # ----------------------------------------------------- node retrieval ---
+    def seed_entities(self, query: str, top: int = 4) -> list[str]:
+        if self.graph.n_entities == 0:
+            return []
+        q_tokens = set(tokenize(query))
+        scored: list[tuple[float, str]] = []
+        names = [(key, data["name"]) for key, data in self.graph.g.nodes(data=True)]
+
+        # Exact / token-overlap match first.
+        for key, name in names:
+            name_tokens = set(tokenize(name))
+            overlap = len(q_tokens & name_tokens)
+            if overlap:
+                scored.append((overlap + 0.5, key))
+        if scored:
+            scored.sort(reverse=True)
+            return [k for _, k in scored[:top]]
+
+        # Fall back to embedding similarity over entity names.
+        q = self.embedder.embed_query(query).dense
+        name_emb = self.embedder.embed([n for _, n in names]).dense
+        sims = [(self.embedder.cosine(q, name_emb[i]), names[i][0]) for i in range(len(names))]
+        sims.sort(reverse=True)
+        return [k for _, k in sims[:top]]
+
+    # -------------------------------------------------- path expansion -----
+    def _expand(self, seeds: list[str]) -> list[_Path]:
+        paths: list[_Path] = []
+        for seed in seeds:
+            self._dfs(seed, [seed], [], paths, visited={seed})
+        return paths
+
+    def _dfs(self, node, nodes, edges, out, visited) -> None:
+        if len(edges) >= self.max_hops:
+            return
+        out_edges = self.graph.out_edges(node)[: self.beam]
+        for _src, dst, data in out_edges:
+            if dst in visited:
+                continue
+            new_edges = [*edges, data]
+            new_nodes = [*nodes, dst]
+            rel = sum(e["reliability"] for e in new_edges) / len(new_edges)
+            out.append(_Path(nodes=new_nodes, edges=new_edges, flow=0.0, reliability=rel))
+            self._dfs(dst, new_nodes, new_edges, out, visited | {dst})
+
+    # ------------------------------------------------- flow-based pruning ---
+    def _assign_flow(self, seeds: list[str]) -> dict[int, float]:
+        """Resource-allocation flow: spread a budget from seeds with decay."""
+        edge_flow: dict[int, float] = {}
+        resource: dict[str, float] = dict.fromkeys(seeds, 1.0)
+        for _hop in range(self.max_hops):
+            nxt: dict[str, float] = {}
+            for node, res in resource.items():
+                out_edges = self.graph.out_edges(node)
+                if not out_edges:
+                    continue
+                denom = sum(e["weight"] * (0.1 + e["reliability"]) for _, _, e in out_edges) or 1.0
+                for _src, dst, data in out_edges:
+                    share = (data["weight"] * (0.1 + data["reliability"])) / denom
+                    transfer = res * DECAY * share
+                    edge_flow[id(data)] = edge_flow.get(id(data), 0.0) + transfer
+                    nxt[dst] = nxt.get(dst, 0.0) + transfer
+            resource = nxt
+            if not resource:
+                break
+        return edge_flow
+
+    def _prune(self, paths: list[_Path], edge_flow: dict[int, float]) -> list[_Path]:
+        for p in paths:
+            p.flow = min((edge_flow.get(id(e), 0.0) for e in p.edges), default=0.0)
+        paths = [p for p in paths if p.flow > 0]
+        paths.sort(key=lambda p: p.score, reverse=True)
+        # De-duplicate by node-set to avoid near-identical paths.
+        seen: set[tuple] = set()
+        pruned: list[_Path] = []
+        for p in paths:
+            key = tuple(p.nodes)
+            if key in seen:
+                continue
+            seen.add(key)
+            pruned.append(p)
+            if len(pruned) >= self.max_paths:
+                break
+        return pruned
+
+    # ------------------------------------------------------ path-to-text ---
+    def _to_evidence(self, path: _Path) -> PathEvidence:
+        names = [self.graph.g.nodes[n]["name"] for n in path.nodes]
+        relations = [e["relation"] for e in path.edges]
+        chunk_ids: list[str] = []
+        for e in path.edges:
+            for prov in e["provenance"]:
+                if prov.chunk_id not in chunk_ids:
+                    chunk_ids.append(prov.chunk_id)
+        # Path-to-text rendering.
+        parts = [names[0]]
+        for i, rel in enumerate(relations):
+            parts.append(f"{rel.replace('_', ' ')} {names[i + 1]}")
+        text = " ".join(parts) + f". (reliability {path.reliability:.2f})"
+        return PathEvidence(
+            nodes=names,
+            relations=relations,
+            reliability=path.reliability,
+            text=text,
+            chunk_ids=chunk_ids,
+        )
+
+    def _golden_order(self, evidences: list[PathEvidence]) -> list[PathEvidence]:
+        """Most reliable paths at the edges of the rendered context."""
+        ranked = sorted(evidences, key=lambda e: e.reliability, reverse=True)
+        head: list[PathEvidence] = []
+        tail: list[PathEvidence] = []
+        for i, e in enumerate(ranked):
+            (head if i % 2 == 0 else tail).append(e)
+        return head + tail[::-1]
+
+    # ------------------------------------------------------------ retrieve --
+    def retrieve(self, query: str, k: int, filt: Filter | None = None) -> RetrievalResult:
+        t0 = time.perf_counter()
+        seeds = self.seed_entities(query)
+        if not seeds:
+            return RetrievalResult(
+                query=query,
+                method=self.name,
+                chunks=[],
+                took_ms=(time.perf_counter() - t0) * 1000,
+                metadata={"seeds": [], "paths": []},
+            )
+        candidate_paths = self._expand(seeds)
+        edge_flow = self._assign_flow(seeds)
+        pruned = self._prune(candidate_paths, edge_flow)
+        evidences = self._golden_order([self._to_evidence(p) for p in pruned])
+
+        # Resolve cited chunks (deduped, ordered by appearance) into ScoredChunks.
+        chunks: list[ScoredChunk] = []
+        seen_ids: set[str] = set()
+        rel_by_chunk: dict[str, float] = {}
+        for ev in evidences:
+            for cid in ev.chunk_ids:
+                rel_by_chunk[cid] = max(rel_by_chunk.get(cid, 0.0), ev.reliability)
+        for ev in evidences:
+            for cid in ev.chunk_ids:
+                if cid in seen_ids:
+                    continue
+                seen_ids.add(cid)
+                chunk = self._resolve(cid, ev)
+                if chunk is None:
+                    continue
+                chunks.append(
+                    ScoredChunk(
+                        chunk=chunk,
+                        score=rel_by_chunk.get(cid, 0.0),
+                        method="pathrag",
+                        rank=len(chunks),
+                    )
+                )
+                if len(chunks) >= k:
+                    break
+            if len(chunks) >= k:
+                break
+
+        return RetrievalResult(
+            query=query,
+            method=self.name,
+            chunks=chunks,
+            took_ms=(time.perf_counter() - t0) * 1000,
+            metadata={
+                "seeds": [self.graph.g.nodes[s]["name"] for s in seeds],
+                "paths": [ev.model_dump() for ev in evidences],
+                "n_candidate_paths": len(candidate_paths),
+            },
+        )
+
+    def _resolve(self, chunk_id: str, ev: PathEvidence) -> Chunk | None:
+        if self.store is not None:
+            ch = self.store.get(chunk_id)
+            if ch is not None:
+                return ch
+        # Fallback: synthesize a chunk from the path text so citations still work.
+        from auralynq.ingest.models import SourceType
+
+        return Chunk(
+            id=chunk_id,
+            doc_id="graph",
+            text=ev.text,
+            source="knowledge_graph",
+            source_type=SourceType.unknown,
+        )
