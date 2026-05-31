@@ -133,21 +133,45 @@ All config is via env vars (prefix `AURALYNQ_`, nested with `__`). See [`.env.ex
 ## 📊 Benchmarks
 
 > Numbers are produced **only** by the evaluation harness (`make eval` / `make bench`)
-> and written to `reports/`. Anything not yet measured is marked **pending**.
+> and written to `reports/`. **Nothing here is hand-written.**
+>
+> ⚠️ **These are measured in the fully-offline `$0` configuration** — hashing
+> embeddings, in-memory store, and the **extractive** LLM fallback — over the
+> frozen 5-item curated golden set (`data/golden/golden_qa.json`). They verify the
+> pipeline end-to-end and the *relative* ordering of methods; they are **not** a
+> quality ceiling. Installing the `embeddings`/`agent` extras (bge-m3 + a real LLM)
+> and running on the full corpus changes the absolute values. Regenerate with
+> `make data && make index && make eval && make bench`.
+
+**Retrieval comparison** (frozen golden set, k=6, nDCG@10):
 
 | Metric | naive | hybrid | PathRAG | full agentic |
-|--------|-------|--------|---------|--------------|
-| Ragas faithfulness | _pending_ | _pending_ | _pending_ | _pending_ |
-| Answer relevancy   | _pending_ | _pending_ | _pending_ | _pending_ |
-| Context precision  | _pending_ | _pending_ | _pending_ | _pending_ |
-| Recall@k           | _pending_ | _pending_ | _pending_ | _pending_ |
-| nDCG@10            | _pending_ | _pending_ | _pending_ | _pending_ |
-| MRR                | _pending_ | _pending_ | _pending_ | _pending_ |
-| Latency p50 (ms)   | _pending_ | _pending_ | _pending_ | _pending_ |
+|--------|------:|-------:|--------:|-------------:|
+| Recall@k         | 1.00 | 1.00 | 0.80 | 0.80 |
+| nDCG@10          | 0.900 | 0.886 | 0.800 | 0.800 |
+| MRR              | 0.867 | 0.850 | 0.800 | 0.800 |
+| Precision@k      | 0.167 | 0.167 | 0.133 | 0.133 |
+| Latency p50 (ms) | 0.1 | 1.3 | 0.1 | 16.6 |
 
-ASR WER and Qdrant quantization recall/latency/memory trade-offs: **pending** (`make bench`).
+**Answer quality** (full agentic, Ragas *proxy* — install `auralynq[eval]` + a real LLM for true Ragas):
 
-Run `make eval && make bench` to regenerate this section from `reports/`.
+| Ragas faithfulness | Answer relevancy | Context precision |
+|-------------------:|-----------------:|------------------:|
+| 0.80 | 0.41 | 0.64 |
+
+**ASR WER** (synthetic sidecar, `null` provider): **0.00** (n=1) — install `auralynq[voice]` for faster-whisper WER on LibriSpeech.
+
+**Qdrant / vector quantization trade-off** (289 vectors, dim 256, recall@10 vs exact float32):
+
+| Quantization | Recall@10 | Memory | Compression | Latency (ms) |
+|--------------|----------:|-------:|------------:|-------------:|
+| none (fp32)  | 1.00 | 289 KB | 1× | 0.011 |
+| scalar (int8)| 1.00 | 72 KB | **4×** | 0.011 |
+| binary (1-bit)| 0.50 | 9 KB | **32×** | 0.011 |
+
+> Binary recall is low here because the **hashing fallback** vectors aren't
+> sign-structured; with bge-m3 dense vectors binary quantization recovers far more.
+> scalar int8 is the sweet spot (full recall at 4× compression).
 
 ## Architecture notes
 
