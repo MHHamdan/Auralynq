@@ -56,6 +56,7 @@ def _dirs() -> dict[str, Path]:
     base = s.data_dir
     d = {
         "corpus": base / "corpus",
+        "corpus_hf": base / "corpus_hf",
         "golden": base / "golden",
         "manifests": base / "manifests",
     }
@@ -258,19 +259,24 @@ def download(sample: bool = True, full: bool = False) -> dict[str, Any]:
     manifest["datasets"]["synthetic"] = synth
     _log.info("data.synthetic_written", **{k: v for k, v in synth.items() if k != "docs"})
 
-    # Best-effort HF augmentation.
+    # Best-effort HF augmentation. HF docs land in a *separate* corpus dir so the
+    # default index/eval run on the curated synthetic corpus (clean, matches the
+    # frozen golden set). Point AURALYNQ at data/corpus_hf for larger experiments.
     extra_golden: list[dict] = []
     for spec in TEXT_DATASETS:
-        info = _try_hf_text(spec, n, dirs["corpus"])
+        info = _try_hf_text(spec, n, dirs["corpus_hf"])
         if info:  # pragma: no cover - network path
             manifest["datasets"][spec["name"]] = {"written": info["written"]}
             extra_golden.extend(info["golden"][:5])
 
+    # Keep the *frozen* golden set (golden_qa.json) curated and reproducible
+    # (ADR-0010). HF-derived QA is written to a separate, optional file so the
+    # drift baseline is stable regardless of upstream dataset availability.
     if extra_golden:  # pragma: no cover - network path
-        golden_path = dirs["golden"] / "golden_qa.json"
-        data = json.loads(golden_path.read_text(encoding="utf-8"))
-        data["items"].extend(extra_golden)
-        golden_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        (dirs["golden"] / "golden_qa_hf.json").write_text(
+            json.dumps({"version": 1, "frozen": False, "items": extra_golden}, indent=2),
+            encoding="utf-8",
+        )
 
     manifest["checksums"] = {
         p.name: _sha256(p.read_text(encoding="utf-8", errors="ignore"))

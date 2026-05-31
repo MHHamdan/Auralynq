@@ -87,10 +87,7 @@ def _agentic(golden, k: int) -> dict[str, Any]:
             {
                 "question": item.question,
                 "answer": res.answer,
-                "contexts": [
-                    c.get("locator", "") + " " + c.get("source", "") for c in res.citations
-                ]
-                or [item.answer],
+                "contexts": res.contexts or [item.answer],
                 "ground_truth": item.answer,
             }
         )

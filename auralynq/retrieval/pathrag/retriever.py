@@ -71,22 +71,35 @@ class PathRAGRetriever(Retriever):
         if self.graph.n_entities == 0:
             return []
         q_tokens = set(tokenize(query))
+        q_lower = query.lower()
         scored: list[tuple[float, str]] = []
-        names = [(key, data["name"]) for key, data in self.graph.g.nodes(data=True)]
+        names = [
+            (key, data["name"], data.get("mentions", 1))
+            for key, data in self.graph.g.nodes(data=True)
+        ]
 
-        # Exact / token-overlap match first.
-        for key, name in names:
+        # Exact / token-overlap match first. Score favours *precision* (entities
+        # whose tokens are mostly in the query) so a concise node like "France"
+        # outranks a long, incidentally-overlapping name like "Senate of France",
+        # with a strong bonus when the entity name appears verbatim in the query.
+        for key, name, mentions in names:
             name_tokens = set(tokenize(name))
+            if not name_tokens:
+                continue
             overlap = len(q_tokens & name_tokens)
-            if overlap:
-                scored.append((overlap + 0.5, key))
+            if not overlap:
+                continue
+            precision = overlap / len(name_tokens)
+            exact = 3.0 if key in q_lower else 0.0
+            score = exact + 2.0 * precision + 0.05 * mentions**0.5
+            scored.append((score, key))
         if scored:
             scored.sort(reverse=True)
             return [k for _, k in scored[:top]]
 
         # Fall back to embedding similarity over entity names.
         q = self.embedder.embed_query(query).dense
-        name_emb = self.embedder.embed([n for _, n in names]).dense
+        name_emb = self.embedder.embed([name for _, name, _ in names]).dense
         sims = [(self.embedder.cosine(q, name_emb[i]), names[i][0]) for i in range(len(names))]
         sims.sort(reverse=True)
         return [k for _, k in sims[:top]]

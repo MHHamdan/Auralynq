@@ -46,6 +46,7 @@ class AnswerResult(BaseModel):
     confidence: float = 0.0
     cached: bool = False
     elapsed_ms: float = 0.0
+    contexts: list[str] = Field(default_factory=list)
     trace: list[dict[str, Any]] = Field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -111,6 +112,7 @@ def answer_question(
         iterations=state.iteration,
         confidence=state.confidence,
         elapsed_ms=round(trace.total_ms, 2),
+        contexts=[c.chunk.text for c in state.contexts],
         trace=trace.to_list(),
     )
     if use_cache and state.answer:

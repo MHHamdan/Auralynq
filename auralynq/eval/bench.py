@@ -25,12 +25,36 @@ _log = get_logger("auralynq.bench")
 
 
 def _vectors() -> np.ndarray:
+    # Prefer a rich, real vector population: embed every chunk across the full
+    # corpus (curated + any HF augmentation) so the quantization recall/memory
+    # curve is statistically meaningful, not a 5-vector toy.
+    s = get_settings()
+    mats: list[np.ndarray] = []
+    try:
+        from auralynq.embeddings.factory import get_embedder
+        from auralynq.ingest.pipeline import ingest_path
+
+        embedder = get_embedder()
+        for sub in ("corpus", "corpus_hf"):
+            d = s.data_dir / sub
+            if not d.exists():
+                continue
+            chunks = [c for doc in ingest_path(d, force=True).documents for c in doc.chunks]
+            if chunks:
+                mats.append(embedder.embed([c.text for c in chunks]).dense.astype(np.float32))
+    except Exception:  # pragma: no cover
+        mats = []
+    if mats:
+        combined = np.vstack(mats)
+        if combined.shape[0] >= 32:
+            return combined
+
     store = get_store()
-    if isinstance(store, MemoryStore) and store._dense is not None and store.count() > 0:
+    if isinstance(store, MemoryStore) and store._dense is not None and store.count() >= 32:
         return store._dense.astype(np.float32)
-    # Fallback: deterministic synthetic vectors.
-    rng = np.random.RandomState(get_settings().seed)
-    return rng.randn(256, 128).astype(np.float32)
+    # Last-resort deterministic synthetic vectors (keeps the bench runnable).
+    rng = np.random.RandomState(s.seed)
+    return rng.randn(256, 256).astype(np.float32)
 
 
 def _normalize(m: np.ndarray) -> np.ndarray:

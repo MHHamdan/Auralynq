@@ -55,7 +55,7 @@ _REL_WORDS = re.compile(
 def _entities_in(sentence: str) -> list[tuple[str, int]]:
     found: list[tuple[str, int]] = []
     for m in _ENTITY_RE.finditer(sentence):
-        raw = m.group(1).strip()
+        raw = " ".join(m.group(1).split())  # collapse internal whitespace/newlines
         raw = _LEADING_DET.sub("", raw).strip()
         if len(raw) < 3 or raw.lower() in _REL_STOP:
             continue
