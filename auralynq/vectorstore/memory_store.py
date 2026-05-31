@@ -122,6 +122,9 @@ class MemoryStore(VectorStore):
     def get(self, chunk_id: str) -> Chunk | None:
         return self._chunks.get(chunk_id)
 
+    def all_chunks(self) -> list[Chunk]:
+        return [self._chunks[cid] for cid in self._order]
+
     def count(self) -> int:
         return len(self._order)
 

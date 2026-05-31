@@ -41,6 +41,10 @@ class VectorStore(abc.ABC):
         """Resolve a chunk by id (used by PathRAG to cite path provenance)."""
         return None
 
+    def all_chunks(self) -> list[Chunk]:
+        """Return every stored chunk (used to rebuild the KG over the full set)."""
+        return []
+
     def search(
         self,
         query: Embedding,

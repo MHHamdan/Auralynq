@@ -8,19 +8,19 @@
   "quantization": {
     "none": {
       "recall_at_k": 1.0,
-      "latency_ms": 0.0112,
+      "latency_ms": 0.0089,
       "memory_bytes": 295936,
       "bits_per_dim": 32
     },
     "scalar": {
       "recall_at_k": 1.0,
-      "latency_ms": 0.0106,
+      "latency_ms": 0.0092,
       "memory_bytes": 73984,
       "bits_per_dim": 8
     },
     "binary": {
       "recall_at_k": 0.5,
-      "latency_ms": 0.0109,
+      "latency_ms": 0.0092,
       "memory_bytes": 9248,
       "bits_per_dim": 1
     }

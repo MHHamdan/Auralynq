@@ -36,7 +36,11 @@ def build_index(input_dir: Path, rebuild: bool = False) -> dict[str, Any]:
     if rebuild:
         store.clear()
 
-    result = ingest_path(Path(input_dir), recursive=True, force=rebuild)
+    # Force a full ingest when the store is empty (e.g. the index dir was cleared
+    # but the ingest manifest persisted) so the index is never left empty due to
+    # a stale idempotency manifest.
+    force = rebuild or store.count() == 0
+    result = ingest_path(Path(input_dir), recursive=True, force=force)
     all_chunks: list[Chunk] = [c for d in result.documents for c in d.chunks]
 
     n_indexed = 0
@@ -47,9 +51,15 @@ def build_index(input_dir: Path, rebuild: bool = False) -> dict[str, Any]:
     if isinstance(store, MemoryStore):
         store.save()
 
-    # Build / update the knowledge graph from all chunks seen this run.
-    kg = build_from_chunks(all_chunks)
-    kg.save(graph_path())
+    # Rebuild the knowledge graph from the *full* indexed set (not just newly
+    # ingested chunks) so an idempotent re-index never wipes the graph. Falls
+    # back to this run's chunks if the store can't enumerate (e.g. remote Qdrant).
+    kg_chunks = store.all_chunks() or all_chunks
+    if kg_chunks:
+        kg = build_from_chunks(kg_chunks)
+        kg.save(graph_path())
+    else:
+        kg = load_graph()  # nothing to index and nothing stored; keep existing
 
     stats = {
         "backend": store.backend,
