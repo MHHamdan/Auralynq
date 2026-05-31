@@ -1,48 +1,112 @@
+# =========================
+# Auralynq - Git ignore
+# =========================
+
+# Local project prompt / private planning
+prompt.md
+*.prompt.md
+CLAUDE.md.local
+
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.token
+*token*
+*secret*
+*api_key*
+*apikey*
+credentials.json
+service-account*.json
+
 # Python
 __pycache__/
 *.py[cod]
-*.egg-info/
-.eggs/
-build/
-dist/
-.venv/
-venv/
+*.pyo
+*.pyd
+.pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.pytest_cache/
 .coverage
 coverage.xml
 htmlcov/
+dist/
+build/
+*.egg-info/
+.venv/
+venv/
+env/
 
-# Env / secrets
-.env
-.env.local
-*.key
+# Jupyter / notebooks
+.ipynb_checkpoints/
 
-# Data & artifacts (kept out of VCS; reproducible via scripts)
-data/
-!data/.gitkeep
-models/
-.cache/
-*.qdrant
-storage/
-
-# Reports are generated; keep the dir + the canonical artifacts that back the
-# README benchmark tables, ignore everything else.
-reports/*
-!reports/.gitkeep
-!reports/eval_report.json
-!reports/bench_report.json
-!reports/golden_baseline.json
-
-# Node / web
+# Node / Next.js
 web/node_modules/
 web/.next/
 web/out/
+web/dist/
 web/.turbo/
+web/.env
+web/.env.*
+!web/.env.example
 
-# OS / editor
-.DS_Store
-.idea/
-.vscode/
+# Local datasets, indexes, generated reports
+data/*
+!data/.gitkeep
+!data/README.md
+
+reports/*
+!reports/.gitkeep
+!reports/README.md
+
+# Model/cache files
+models/
+model_cache/
+.cache/
+.huggingface/
+torch_cache/
+whisper_cache/
+qdrant_storage/
+storage/
+tmp/
+temp/
+
+# Audio/video/generated demo artifacts
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.mp4
+*.mov
+*.avi
+
+# Logs
 *.log
+logs/
+
+# Podman / compose local artifacts
+.podman/
+containers/.env
+containers/.env.*
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+
+# Large archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
