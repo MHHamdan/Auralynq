@@ -27,9 +27,13 @@ models/
 *.qdrant
 storage/
 
-# Reports are generated; keep the dir but ignore large outputs
+# Reports are generated; keep the dir + the canonical artifacts that back the
+# README benchmark tables, ignore everything else.
 reports/*
 !reports/.gitkeep
+!reports/eval_report.json
+!reports/bench_report.json
+!reports/golden_baseline.json
 
 # Node / web
 web/node_modules/
