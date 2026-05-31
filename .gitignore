@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Env / secrets
+.env
+.env.local
+*.key
+
+# Data & artifacts (kept out of VCS; reproducible via scripts)
+data/
+!data/.gitkeep
+models/
+.cache/
+*.qdrant
+storage/
+
+# Reports are generated; keep the dir but ignore large outputs
+reports/*
+!reports/.gitkeep
+
+# Node / web
+web/node_modules/
+web/.next/
+web/out/
+web/.turbo/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.log

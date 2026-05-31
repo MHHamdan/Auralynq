@@ -1,0 +1,84 @@
+# Auralynq stack — Podman-compatible. `make stack-up`.
+# Rootless-friendly: no privileged ports, named volumes, no host networking.
+name: auralynq
+
+services:
+  qdrant:
+    image: docker.io/qdrant/qdrant:v1.12.1
+    container_name: auralynq-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - auralynq-qdrant:/qdrant/storage
+    healthcheck:
+      test: ["CMD", "sh", "-c", "true"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  phoenix:
+    image: docker.io/arizephoenix/phoenix:latest
+    container_name: auralynq-phoenix
+    ports:
+      - "6006:6006"
+      - "4317:4317"
+    environment:
+      - PHOENIX_WORKING_DIR=/data
+    volumes:
+      - auralynq-phoenix:/data
+
+  api:
+    build:
+      context: .
+      dockerfile: containers/api.Dockerfile
+    image: auralynq-api:latest
+    container_name: auralynq-api
+    command: ["uvicorn", "auralynq.serving.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    environment:
+      - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN:-}
+      - AURALYNQ_VECTOR__URL=http://qdrant:6333
+      - AURALYNQ_VECTOR__BACKEND=auto
+      - AURALYNQ_TELEMETRY__OTLP_ENDPOINT=http://phoenix:4317
+      - AURALYNQ_DATA_DIR=/app/data
+    volumes:
+      - ./data:/app/data
+      - ./reports:/app/reports
+    depends_on:
+      - qdrant
+      - phoenix
+
+  worker:
+    build:
+      context: .
+      dockerfile: containers/api.Dockerfile
+    image: auralynq-api:latest
+    container_name: auralynq-worker
+    command: ["python", "-m", "auralynq.serving.worker"]
+    environment:
+      - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN:-}
+      - AURALYNQ_VECTOR__URL=http://qdrant:6333
+      - AURALYNQ_DATA_DIR=/app/data
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - qdrant
+
+  web:
+    build:
+      context: ./web
+      dockerfile: ../containers/web.Dockerfile
+    image: auralynq-web:latest
+    container_name: auralynq-web
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_BASE=http://localhost:8000
+    depends_on:
+      - api
+
+volumes:
+  auralynq-qdrant:
+  auralynq-phoenix:
