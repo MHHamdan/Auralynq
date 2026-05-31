@@ -1,0 +1,190 @@
+"""Qdrant vector store (optional, requires the ``vector`` extra + a running server).
+
+Uses named vectors: a ``dense`` vector and a ``sparse`` lexical vector for true
+hybrid retrieval. Supports payload indexes, metadata filters, and scalar/binary
+quantization (benchmarked by ``make bench``). Falls back to MemoryStore upstream
+if the server/library is unavailable (see factory).
+"""
+
+from __future__ import annotations
+
+import contextlib
+from typing import Any
+
+import numpy as np
+
+from auralynq.config import get_settings
+from auralynq.embeddings.base import EmbeddingBatch, SparseVector
+from auralynq.ingest.models import Chunk
+from auralynq.retrieval.models import Filter, ScoredChunk
+from auralynq.telemetry import get_logger
+from auralynq.vectorstore.base import VectorStore
+
+_log = get_logger("auralynq.vectorstore.qdrant")
+DENSE = "dense"
+SPARSE = "sparse"
+
+
+class QdrantStore(VectorStore):
+    backend = "qdrant"
+
+    def __init__(
+        self, url: str | None = None, collection: str | None = None, quantization: str = "none"
+    ) -> None:
+        from qdrant_client import QdrantClient
+
+        s = get_settings()
+        self.collection = collection or s.vector.collection
+        self.quantization = quantization or s.vector.quantization
+        self._hnsw_m = s.vector.hnsw_m
+        self.client = QdrantClient(url=url or s.vector.url, timeout=30.0)
+        self._dim = 0
+        _log.info("qdrant.connected", url=url or s.vector.url, collection=self.collection)
+
+    def ensure_collection(self, dim: int) -> None:
+        from qdrant_client import models as qm
+
+        self._dim = dim
+        if self.client.collection_exists(self.collection):
+            return
+        quant = None
+        if self.quantization == "scalar":
+            quant = qm.ScalarQuantization(
+                scalar=qm.ScalarQuantizationConfig(type=qm.ScalarType.INT8, always_ram=True)
+            )
+        elif self.quantization == "binary":
+            quant = qm.BinaryQuantization(binary=qm.BinaryQuantizationConfig(always_ram=True))
+
+        self.client.create_collection(
+            collection_name=self.collection,
+            vectors_config={
+                DENSE: qm.VectorParams(
+                    size=dim,
+                    distance=qm.Distance.COSINE,
+                    hnsw_config=qm.HnswConfigDiff(m=self._hnsw_m),
+                )
+            },
+            sparse_vectors_config={
+                SPARSE: qm.SparseVectorParams(index=qm.SparseIndexParams(on_disk=False))
+            },
+            quantization_config=quant,
+        )
+        for field, schema in (
+            ("doc_id", qm.PayloadSchemaType.KEYWORD),
+            ("source_type", qm.PayloadSchemaType.KEYWORD),
+            ("speaker", qm.PayloadSchemaType.KEYWORD),
+        ):
+            with contextlib.suppress(Exception):  # index may already exist
+                self.client.create_payload_index(self.collection, field, schema)
+
+    def upsert(self, chunks: list[Chunk], embeddings: EmbeddingBatch) -> int:
+        from qdrant_client import models as qm
+
+        if not chunks:
+            return 0
+        self.ensure_collection(int(embeddings.dense.shape[1]))
+        points = []
+        for i, ch in enumerate(chunks):
+            sparse = embeddings.sparse[i] if embeddings.sparse else {}
+            points.append(
+                qm.PointStruct(
+                    id=_uuid(ch.id),
+                    vector={
+                        DENSE: embeddings.dense[i].tolist(),
+                        SPARSE: qm.SparseVector(
+                            indices=list(sparse.keys()),
+                            values=[float(v) for v in sparse.values()],
+                        ),
+                    },
+                    payload=_payload(ch),
+                )
+            )
+        self.client.upsert(self.collection, points=points, wait=True)
+        return len(points)
+
+    def _filter(self, filt: Filter | None):
+        from qdrant_client import models as qm
+
+        if filt is None:
+            return None
+        must = []
+        if filt.doc_ids:
+            must.append(qm.FieldCondition(key="doc_id", match=qm.MatchAny(any=filt.doc_ids)))
+        if filt.source_types:
+            must.append(
+                qm.FieldCondition(key="source_type", match=qm.MatchAny(any=filt.source_types))
+            )
+        for k, v in filt.must.items():
+            must.append(qm.FieldCondition(key=k, match=qm.MatchValue(value=v)))
+        return qm.Filter(must=must) if must else None
+
+    def search_dense(self, dense, k: int, filt: Filter | None = None) -> list[ScoredChunk]:
+        res = self.client.query_points(
+            self.collection,
+            query=np.asarray(dense).tolist(),
+            using=DENSE,
+            limit=k,
+            with_payload=True,
+            query_filter=self._filter(filt),
+        )
+        return _to_scored(res.points, "dense")
+
+    def search_sparse(
+        self, sparse: SparseVector, k: int, filt: Filter | None = None
+    ) -> list[ScoredChunk]:
+        from qdrant_client import models as qm
+
+        if not sparse:
+            return []
+        res = self.client.query_points(
+            self.collection,
+            query=qm.SparseVector(
+                indices=list(sparse.keys()), values=[float(v) for v in sparse.values()]
+            ),
+            using=SPARSE,
+            limit=k,
+            with_payload=True,
+            query_filter=self._filter(filt),
+        )
+        return _to_scored(res.points, "sparse")
+
+    def get(self, chunk_id: str) -> Chunk | None:
+        try:
+            pts = self.client.retrieve(self.collection, ids=[_uuid(chunk_id)], with_payload=True)
+        except Exception:  # pragma: no cover
+            return None
+        if not pts:
+            return None
+        payload = dict(pts[0].payload or {})
+        payload.pop("speaker", None)
+        return Chunk.model_validate(payload)
+
+    def count(self) -> int:
+        return int(self.client.count(self.collection, exact=True).count)
+
+    def clear(self) -> None:
+        if self.client.collection_exists(self.collection):
+            self.client.delete_collection(self.collection)
+
+
+def _uuid(chunk_id: str) -> str:
+    import uuid
+
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, chunk_id))
+
+
+def _payload(ch: Chunk) -> dict[str, Any]:
+    p = ch.model_dump(mode="json")
+    p["speaker"] = ch.audio.speaker if ch.audio else None
+    p["source_type"] = ch.source_type.value
+    return p
+
+
+def _to_scored(points, method: str) -> list[ScoredChunk]:
+    out: list[ScoredChunk] = []
+    for rank, pt in enumerate(points):
+        payload = dict(pt.payload or {})
+        payload.pop("speaker", None)
+        ch = Chunk.model_validate(payload)
+        out.append(ScoredChunk(chunk=ch, score=float(pt.score), method=method, rank=rank))
+    return out
