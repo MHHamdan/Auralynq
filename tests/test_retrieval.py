@@ -60,8 +60,8 @@ def test_mmr_reduces_redundancy():
 def test_mmr_caches_candidate_embeddings():
     # Repeated MMR over the same candidate texts must not re-embed them: a perf
     # guard for the bounded per-text embedding cache.
-    from auralynq.embeddings.base import EmbeddingBatch
     import numpy as np
+    from auralynq.embeddings.base import EmbeddingBatch
 
     class CountingEmbedder:
         model = "counting"
