@@ -84,6 +84,7 @@ class RAGStrategyRegistry:
                 result = strategy.run(query, **kwargs)
                 result.fallback_strategy = _DEFAULT_STRATEGY_ID
                 result.fallback_reason = f"unknown_strategy: {strategy_id}"
+                result.strategy_warnings = [f"Unknown strategy '{strategy_id}'. Fell back to {_DEFAULT_STRATEGY_ID}."]
                 return result
             raise ValueError(f"Unknown RAG strategy: {strategy_id}")
 

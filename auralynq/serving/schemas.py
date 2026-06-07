@@ -56,6 +56,10 @@ class QueryResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     provider_status: list[dict[str, str]] = Field(default_factory=list)
     request_id: str = ""
+    selected_rag_strategy: str | None = None
+    fallback_strategy: str | None = None
+    fallback_reason: str | None = None
+    strategy_warnings: list[str] = Field(default_factory=list)
 
 
 class CorpusSummaryResponse(BaseModel):

@@ -503,6 +503,9 @@ def create_app() -> FastAPI:
             "suggested_questions": result.suggested_questions,
             "warnings": result.warnings + (result.strategy_warnings or []),
             "selected_rag_strategy": result.fallback_strategy or strategy_id,
+            "fallback_strategy": result.fallback_strategy,
+            "fallback_reason": result.fallback_reason,
+            "strategy_warnings": result.strategy_warnings or [],
         }
         try:
             _last_eval.clear()
