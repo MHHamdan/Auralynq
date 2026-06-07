@@ -471,28 +471,52 @@ def create_app() -> FastAPI:
             data["selected_rag_strategy"] = "system"
             return QueryResponse(request_id=request.state.request_id, **data)
 
-        from auralynq.agent.runner import answer_question
+        from auralynq.rag import get_registry
 
-        res = await asyncio.to_thread(
-            answer_question,
+        strategy_id = req.rag_strategy or "auralynq_rag"
+        registry = get_registry()
+        result = await asyncio.to_thread(
+            registry.run,
+            strategy_id,
             req.question,
             final_k=req.final_k,
-            use_cache=req.use_cache,
+            use_cache=req.use_cache if req.use_cache is not None else True,
             route_hint=req.route_hint or "",
         )
-        d = res.to_dict()
-        # Store for /eval/last
+        d = {
+            "answer": result.answer,
+            "status": result.status,
+            "citations": result.citations,
+            "route": result.route,
+            "route_confidence": result.route_confidence,
+            "route_rationale": result.route_rationale,
+            "path_evidence": result.path_evidence,
+            "seeds": result.seeds,
+            "iterations": result.iterations,
+            "confidence": result.confidence,
+            "evidence_coverage": result.evidence_coverage,
+            "cached": result.cached,
+            "elapsed_ms": result.elapsed_ms,
+            "trace": result.trace,
+            "trace_steps": result.trace_steps,
+            "detected_entities": result.detected_entities,
+            "suggested_questions": result.suggested_questions,
+            "warnings": result.warnings + (result.strategy_warnings or []),
+            "selected_rag_strategy": result.fallback_strategy or strategy_id,
+        }
         try:
             _last_eval.clear()
             _last_eval.update({
-                "strategy": "auralynq_rag",
-                "route": d.get("route"),
-                "confidence": d.get("confidence"),
-                "evidence_coverage": d.get("evidence_coverage"),
-                "citations": len(d.get("citations", [])),
-                "elapsed_ms": d.get("elapsed_ms"),
-                "status": d.get("status"),
-                "warnings": d.get("warnings", []),
+                "strategy": result.fallback_strategy or strategy_id,
+                "requested_strategy": strategy_id,
+                "fallback_strategy": result.fallback_strategy,
+                "route": result.route,
+                "confidence": result.confidence,
+                "evidence_coverage": result.evidence_coverage,
+                "citations": len(result.citations or []),
+                "elapsed_ms": result.elapsed_ms,
+                "status": result.status,
+                "warnings": result.warnings + (result.strategy_warnings or []),
             })
         except Exception:
             pass
@@ -502,10 +526,10 @@ def create_app() -> FastAPI:
     async def query_stream(req: QueryRequest, request: Request) -> EventSourceResponse:
         _METRICS["query_stream_total"] += 1
         intent = _classify_corpus_intent(req.question)
+        requested_strategy_id = req.rag_strategy or "auralynq_rag"
 
         async def event_gen():
             if intent:
-                # System answer — emit as a single final event, no tokens
                 data = await asyncio.to_thread(_system_answer_for_intent, intent, req.question)
                 yield {"event": "meta", "data": json.dumps({
                     "type": "meta",
@@ -514,22 +538,138 @@ def create_app() -> FastAPI:
                     "rationale": f"retrieval skipped: {intent}",
                     "seeds": [],
                     "path_evidence": [],
+                    "selected_rag_strategy": "system",
                 })}
-                yield {"event": "final", "data": json.dumps({"type": "final", **data})}
+                yield {"event": "final", "data": json.dumps({
+                    "type": "final",
+                    **data,
+                    "selected_rag_strategy": "system",
+                })}
                 return
 
             from auralynq.agent.runner import stream_answer_question
+            from auralynq.rag import get_registry
 
-            # Drive the blocking token generator one step at a time in a worker
-            # thread (_aiter_sync) so streaming never stalls the event loop.
-            gen = stream_answer_question(req.question, final_k=req.final_k)
-            async for event in _aiter_sync(gen):
-                if await request.is_disconnected():
-                    close = getattr(gen, "close", None)
-                    if close is not None:
-                        close()  # stop the underlying generator promptly
-                    break
-                yield {"event": event["type"], "data": json.dumps(event)}
+            registry = get_registry()
+
+            # Resolve effective strategy and fallback metadata without running yet.
+            effective_id = requested_strategy_id
+            fallback_strategy: str | None = None
+            fallback_reason: str | None = None
+            strategy_warnings: list[str] = []
+
+            strategy = registry.get(requested_strategy_id)
+            if strategy is None:
+                effective_id = "auralynq_rag"
+                fallback_strategy = "auralynq_rag"
+                fallback_reason = f"unknown_strategy: {requested_strategy_id}"
+                strategy_warnings.append(
+                    f"Unknown strategy '{requested_strategy_id}', fell back to auralynq_rag."
+                )
+            else:
+                available, reason = strategy.is_available()
+                if not available:
+                    effective_id = "auralynq_rag"
+                    fallback_strategy = "auralynq_rag"
+                    fallback_reason = reason
+                    strategy_warnings.append(
+                        f"Strategy '{requested_strategy_id}' unavailable: {reason}. "
+                        "Fell back to auralynq_rag."
+                    )
+
+            if effective_id == "auralynq_rag":
+                # Full token-streaming path via the agentic runner.
+                gen = stream_answer_question(req.question, final_k=req.final_k)
+                async for event in _aiter_sync(gen):
+                    if await request.is_disconnected():
+                        close = getattr(gen, "close", None)
+                        if close is not None:
+                            close()
+                        break
+                    if event.get("type") == "meta":
+                        event["selected_rag_strategy"] = effective_id
+                        event["fallback_strategy"] = fallback_strategy
+                        event["fallback_reason"] = fallback_reason
+                    elif event.get("type") == "final":
+                        event["selected_rag_strategy"] = effective_id
+                        event["fallback_strategy"] = fallback_strategy
+                        event["fallback_reason"] = fallback_reason
+                        event["strategy_warnings"] = strategy_warnings
+                        try:
+                            _last_eval.clear()
+                            _last_eval.update({
+                                "strategy": effective_id,
+                                "requested_strategy": requested_strategy_id,
+                                "fallback_strategy": fallback_strategy,
+                                "route": event.get("route"),
+                                "confidence": event.get("confidence"),
+                                "evidence_coverage": event.get("evidence_coverage"),
+                                "citations": len(event.get("citations", [])),
+                                "elapsed_ms": event.get("elapsed_ms"),
+                                "status": event.get("status"),
+                                "warnings": strategy_warnings,
+                            })
+                        except Exception:
+                            pass
+                    yield {"event": event["type"], "data": json.dumps(event)}
+            else:
+                # Non-auralynq_rag strategy: run blocking, emit meta + final.
+                result = await asyncio.to_thread(
+                    registry.run,
+                    effective_id,
+                    req.question,
+                    fallback_allowed=False,
+                    force_strategy=True,
+                    final_k=req.final_k,
+                    use_cache=req.use_cache if req.use_cache is not None else True,
+                    route_hint=req.route_hint or "",
+                )
+                combined_warnings = strategy_warnings + (result.strategy_warnings or [])
+                yield {"event": "meta", "data": json.dumps({
+                    "type": "meta",
+                    "route": result.route or "auto",
+                    "confidence": result.route_confidence or 0.0,
+                    "rationale": result.route_rationale or "",
+                    "seeds": result.seeds or [],
+                    "path_evidence": result.path_evidence or [],
+                    "selected_rag_strategy": effective_id,
+                    "fallback_strategy": None,
+                    "fallback_reason": None,
+                })}
+                try:
+                    _last_eval.clear()
+                    _last_eval.update({
+                        "strategy": effective_id,
+                        "requested_strategy": requested_strategy_id,
+                        "fallback_strategy": None,
+                        "route": result.route,
+                        "confidence": result.confidence,
+                        "evidence_coverage": result.evidence_coverage,
+                        "citations": len(result.citations or []),
+                        "elapsed_ms": result.elapsed_ms,
+                        "status": result.status,
+                        "warnings": combined_warnings,
+                    })
+                except Exception:
+                    pass
+                yield {"event": "final", "data": json.dumps({
+                    "type": "final",
+                    "answer": result.answer,
+                    "status": result.status,
+                    "citations": result.citations or [],
+                    "confidence": result.confidence,
+                    "evidence_coverage": result.evidence_coverage,
+                    "elapsed_ms": result.elapsed_ms,
+                    "trace": result.trace or [],
+                    "trace_steps": result.trace_steps or [],
+                    "detected_entities": [],
+                    "suggested_questions": [],
+                    "warnings": combined_warnings,
+                    "strategy_warnings": combined_warnings,
+                    "selected_rag_strategy": effective_id,
+                    "fallback_strategy": None,
+                    "fallback_reason": None,
+                })}
 
         return EventSourceResponse(event_gen())
 

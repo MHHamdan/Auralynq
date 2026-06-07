@@ -15,6 +15,10 @@ class QueryRequest(BaseModel):
         default=None,
         description="Override the adaptive router: 'fast' | 'hybrid' | 'graph' | 'auto'.",
     )
+    rag_strategy: str | None = Field(
+        default=None,
+        description="RAG strategy id from /api/rag/strategies. Defaults to auralynq_rag.",
+    )
 
 
 class Citation(BaseModel):
