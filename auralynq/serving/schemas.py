@@ -171,3 +171,51 @@ class CorpusDeleteReportResponse(BaseModel):
     errors: list[str] = Field(default_factory=list)
     final_inventory: dict[str, Any] | None = None
     reason: str | None = None
+
+
+# ---------------------------------------------------------------------- RAG strategies --
+class RAGStrategyInfo(BaseModel):
+    id: str
+    name: str
+    description: str
+    status: str
+    required_features: list[str] = Field(default_factory=list)
+    supports_streaming: bool = True
+    supports_graph: bool = False
+    supports_rerank: bool = False
+    supports_web: bool = False
+    supports_abstention: bool = True
+    expected_latency: str = "medium"
+    best_for: str = ""
+    limitations: str = ""
+    available: bool = True
+    unavailable_reason: str | None = None
+
+
+class RAGStrategiesResponse(BaseModel):
+    strategies: list[RAGStrategyInfo]
+    default_strategy: str
+
+
+# ---------------------------------------------------------------------- eval --
+class EvalFeedbackRequest(BaseModel):
+    query_id: str | None = None
+    answer_rating: int | None = Field(default=None, ge=1, le=5)
+    citation_correct: bool | None = None
+    answer_supported: bool | None = None
+    notes: str | None = None
+
+
+class EvalRunExportRequest(BaseModel):
+    query_id: str | None = None
+
+
+# Extended query request with strategy selection
+class QueryRequestV2(BaseModel):
+    question: str = Field(..., min_length=1, max_length=4000)
+    final_k: int | None = Field(default=None, ge=1, le=50)
+    use_cache: bool | None = None
+    route_hint: str | None = Field(default=None, description="Override route: 'fast' | 'hybrid' | 'graph' | 'auto'")
+    rag_strategy: str | None = Field(default=None, description="RAG strategy id from /api/rag/strategies")
+    force_strategy: bool = Field(default=False, description="Fail if strategy is unavailable (no fallback)")
+    fallback_allowed: bool = Field(default=True, description="Allow fallback to default strategy")

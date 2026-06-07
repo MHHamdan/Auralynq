@@ -39,11 +39,14 @@ from auralynq.serving.schemas import (
     CorpusDeleteDocumentPreviewResponse,
     CorpusDeleteReportResponse,
     CorpusSummaryResponse,
+    EvalFeedbackRequest,
     HealthResponse,
     IngestResponse,
     ObservabilitySummaryResponse,
     QueryRequest,
+    QueryRequestV2,
     QueryResponse,
+    RAGStrategiesResponse,
     StatusResponse,
     SuggestionsResponse,
     VoiceResponse,
@@ -465,12 +468,11 @@ def create_app() -> FastAPI:
         intent = _classify_corpus_intent(req.question)
         if intent:
             data = await asyncio.to_thread(_system_answer_for_intent, intent, req.question)
+            data["selected_rag_strategy"] = "system"
             return QueryResponse(request_id=request.state.request_id, **data)
 
         from auralynq.agent.runner import answer_question
 
-        # answer_question is CPU/network-bound and synchronous; run it off the event
-        # loop so concurrent requests aren't blocked behind it.
         res = await asyncio.to_thread(
             answer_question,
             req.question,
@@ -478,7 +480,23 @@ def create_app() -> FastAPI:
             use_cache=req.use_cache,
             route_hint=req.route_hint or "",
         )
-        return QueryResponse(request_id=request.state.request_id, **res.to_dict())
+        d = res.to_dict()
+        # Store for /eval/last
+        try:
+            _last_eval.clear()
+            _last_eval.update({
+                "strategy": "auralynq_rag",
+                "route": d.get("route"),
+                "confidence": d.get("confidence"),
+                "evidence_coverage": d.get("evidence_coverage"),
+                "citations": len(d.get("citations", [])),
+                "elapsed_ms": d.get("elapsed_ms"),
+                "status": d.get("status"),
+                "warnings": d.get("warnings", []),
+            })
+        except Exception:
+            pass
+        return QueryResponse(request_id=request.state.request_id, **d)
 
     @app.post("/query/stream")
     async def query_stream(req: QueryRequest, request: Request) -> EventSourceResponse:
@@ -615,7 +633,7 @@ def create_app() -> FastAPI:
                 if msg.get("bytes") is not None:
                     if len(buffer) + len(msg["bytes"]) > ws_limit:
                         await ws.send_json(
-                            {"type": "error", "detail": f"buffer exceeds {s.serve.max_upload_mb} MB"}  # noqa: E501
+                            {"type": "error", "detail": f"buffer exceeds {s.serve.max_upload_mb} MB"}
                         )
                         buffer.clear()
                         continue
@@ -647,7 +665,100 @@ def create_app() -> FastAPI:
         except (WebSocketDisconnect, RuntimeError):  # client closed
             return
 
+    # --------------------------------------------------------- RAG strategies ---
+    @app.get("/rag/strategies", response_model=RAGStrategiesResponse)
+    async def rag_strategies_ep() -> RAGStrategiesResponse:
+        from auralynq.rag import get_registry
+
+        registry = get_registry()
+        strategies_raw = registry.list_all()
+        from auralynq.serving.schemas import RAGStrategyInfo
+
+        return RAGStrategiesResponse(
+            strategies=[RAGStrategyInfo(**s) for s in strategies_raw],
+            default_strategy=registry.default_strategy_id,
+        )
+
+    # v2 query endpoint with strategy selection
+    @app.post("/query/v2", response_model=QueryResponse)
+    async def query_v2(req: QueryRequestV2, request: Request) -> QueryResponse:
+        _METRICS["query_total"] += 1
+        intent = _classify_corpus_intent(req.question)
+        if intent:
+            data = await asyncio.to_thread(_system_answer_for_intent, intent, req.question)
+            data["selected_rag_strategy"] = "system"
+            data["requested_rag_strategy"] = req.rag_strategy
+            return QueryResponse(request_id=request.state.request_id, **data)
+
+        strategy_id = req.rag_strategy or "auralynq_rag"
+        from auralynq.rag import get_registry
+
+        registry = get_registry()
+        result = await asyncio.to_thread(
+            registry.run,
+            strategy_id,
+            req.question,
+            fallback_allowed=req.fallback_allowed,
+            force_strategy=req.force_strategy,
+            final_k=req.final_k,
+            use_cache=req.use_cache if req.use_cache is not None else True,
+            route_hint=req.route_hint or "",
+        )
+        data = {
+            "answer": result.answer,
+            "status": result.status,
+            "citations": result.citations,
+            "route": result.route,
+            "route_confidence": result.route_confidence,
+            "route_rationale": result.route_rationale,
+            "path_evidence": result.path_evidence,
+            "seeds": result.seeds,
+            "iterations": result.iterations,
+            "confidence": result.confidence,
+            "evidence_coverage": result.evidence_coverage,
+            "cached": result.cached,
+            "elapsed_ms": result.elapsed_ms,
+            "trace": result.trace,
+            "trace_steps": result.trace_steps,
+            "detected_entities": result.detected_entities,
+            "suggested_questions": result.suggested_questions,
+            "warnings": result.warnings + (result.strategy_warnings or []),
+        }
+        return QueryResponse(request_id=request.state.request_id, **data)
+
     # -------------------------------------------------------------- eval ---
+    # In-memory last-run eval store (resets on restart — ephemeral by design)
+    _last_eval: dict = {}
+    _eval_feedback: list[dict] = []
+
+    @app.get("/eval/last")
+    async def eval_last() -> JSONResponse:
+        if not _last_eval:
+            return JSONResponse({"status": "pending", "detail": "No query has been run yet."})
+        return JSONResponse(_last_eval)
+
+    @app.get("/eval/summary")
+    async def eval_summary() -> JSONResponse:
+        if not _eval_feedback:
+            return JSONResponse({"total_feedback": 0, "avg_rating": None, "citation_correct_rate": None})
+        ratings = [f["answer_rating"] for f in _eval_feedback if f.get("answer_rating")]
+        citations = [f["citation_correct"] for f in _eval_feedback if f.get("citation_correct") is not None]
+        return JSONResponse({
+            "total_feedback": len(_eval_feedback),
+            "avg_rating": sum(ratings) / len(ratings) if ratings else None,
+            "citation_correct_rate": sum(citations) / len(citations) if citations else None,
+        })
+
+    @app.post("/eval/feedback")
+    async def eval_feedback(req: EvalFeedbackRequest) -> JSONResponse:
+        entry = req.model_dump()
+        _eval_feedback.append(entry)
+        return JSONResponse({"status": "recorded", "total": len(_eval_feedback)})
+
+    @app.post("/eval/export-run")
+    async def eval_export_run() -> JSONResponse:
+        return JSONResponse({"last_eval": _last_eval, "feedback": _eval_feedback[-10:]})
+
     @app.get("/eval/report")
     async def eval_report() -> JSONResponse:
         path = get_settings().reports_dir / "eval_report.json"
